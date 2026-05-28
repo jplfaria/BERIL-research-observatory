@@ -1,6 +1,9 @@
 # CGA tool catalog
 
-Per-tool reference for the 8 CTS tools in the CGA workflow. Each entry includes the image reference, refdata binding, args template, default resource budget, and what comes out the other end. **Always verify image SHAs and refdata UUIDs at runtime via `tscli.images.list_images()` and `tscli.refdata.list_refdata()` before submitting** - the values below are the latest known but tools get re-registered.
+Per-tool reference for the 8 CTS tools in the CGA workflow. Each entry includes the image reference, refdata binding, args template, default resource budget, and what comes out the other end. **Always verify image SHAs and refdata UUIDs at runtime before submitting** - the values below are the latest known but tools get re-registered:
+
+- Images: `tscli.get_images()` returns a formatted text listing (one record per image starting with `# <image-ref>`); parse with `re.split(r"^(?=# )", raw, flags=re.MULTILINE)` and look for `digest:` lines to pin SHAs. Each image record also carries `refdata_id`, `default_refdata_mount_point`, `entrypoint`, and a **`usage:`** field — the registrar's authoritative note on required args + env vars. The templates below were verified against the `usage:` fields on 2026-05-28. **If a `usage:` field disagrees with a template here, the image record wins** — registrars update images more often than this catalog. Refdata is bound at image registration time, not at job submission: `submit_job` only needs `refdata_mount_point` to override the default (typically `/ref_data`).
+- Refdata: `CTSClient` v0.2.1 has no public refdata accessor; use the internal request helper `tscli._cts_request("refdata")["data"]` (list of dicts with `id`, `file`, `crc64nvme`, `statuses`). Switch to a public accessor when `cdm-task-service-client` adds one.
 
 The canonical demo notebook for each tool is linked from the `kbaseincubator/cdm_tool_skeleton` README's "Demo notebooks" table. When in doubt, read the demo.
 
@@ -19,9 +22,12 @@ The canonical demo notebook for each tool is linked from the `kbaseincubator/cdm
   args=[
       "--prefix", "<basename>",
       "--output", "/out",
+      "--threads", "4",
+      "--force",                  # CTS pre-creates /out, so bakta_proteins needs --force
       tscli.insert_files(),
   ]
   ```
+  `BAKTA_DB=/ref_data/db` is baked into the image; do NOT pass `--db`.
 - **Resources:** cpus=4, memory=16GB, runtime=PT60M (per-genome; archaeal genomes can finish in <5 min)
 - **Run order:** parallel fan-out; submit one container per input genome
 
@@ -40,6 +46,8 @@ The canonical demo notebook for each tool is linked from the `kbaseincubator/cdm
   args=[
       "-o", "/out/<basename>.annotations.tsv",
       "--cpu", "4",
+      "-p", "/ref_data/profiles",      # required: KO HMM profile dir inside the refdata mount
+      "-k", "/ref_data/ko_list",       # required: KO threshold table
       tscli.insert_files(),
   ]
   ```
@@ -65,7 +73,8 @@ The canonical demo notebook for each tool is linked from the `kbaseincubator/cdm
   ```
 - **Resources:** cpus=2, memory=4GB, runtime=PT30M
 - **Run order:** parallel fan-out
-- **Caveat:** psortb needs a Gram-stain hint (`-n` Gram-negative, `-p` Gram-positive, `-a` archaea). The current CGA demo runs `-n` for all four test genomes which is wrong for the archaeal pair; per-genome config is a known gap. For a clean run, the skill should infer Gram from gtdbtk's phylum once gtdbtk is done - but for v1 we accept the same approximation (run `-n` by default) and surface a warning in the report.
+- **Caveat (Gram hint):** psortb needs a Gram-stain hint (`-n` Gram-negative, `-p` Gram-positive, `-a` archaea). The current CGA demo runs `-n` for all four test genomes which is wrong for the archaeal pair; per-genome config is a known gap. For a clean run, the skill should infer Gram from gtdbtk's phylum once gtdbtk is done - but for v1 we accept the same approximation (run `-n` by default) and surface a warning in the report.
+- **Caveat (input format — found 2026-05-28):** psortb silently produces an EMPTY `out.psortb.tsv` (0 bytes, job still marked `complete`) when the input `.faa` has proteins ending in `*` (stop codon). pyrodigal and standard prodigal both emit trailing `*` by default. Pre-process protein FASTAs to strip `*` characters before upload: `sed -i 's/\*$//' input.faa` or, in Python, `seq = seq.rstrip("*")` per record. Verify after a run by checking `os.stat(...).st_size > 0` on the psortb output and surfacing "psortb empty — check input format" if it is.
 
 ---
 
@@ -103,13 +112,18 @@ The canonical demo notebook for each tool is linked from the `kbaseincubator/cdm
 - **Args (template):**
   ```python
   args=["classify_wf",
-        "--genome_dir", tscli.insert_files(),
+        "--genome_dir", "/input_files",   # the INPUT MOUNT DIR — gtdbtk scans for files matching --extension
         "--out_dir", "/out",
         "--cpus", "4",
-        "--skip_ani_screen"]      # optional flag depending on R232 sub-version; verify in demo
+        "--extension", "fna.gz"]          # match your uploaded assembly extension exactly
   ```
-- **Resources:** cpus=4, memory=64GB, runtime=PT60M
-- **Run order:** parallel fan-out (each genome is independent)
+  Notes:
+  - Pass `--genome_dir /input_files` (the default `input_mount_point`), **not** `tscli.insert_files()`. `classify_wf` takes a directory, not a file list; the inserted-file placeholder would expand to a file path and gtdbtk would error.
+  - Do **not** pass `--skip_ani_screen` — it's not a flag in `gtdbtk:0.1.1` (`gtdbtk: error: unrecognized arguments: --skip_ani_screen`). Earlier R220 builds accepted it; R232 dropped it.
+  - `GTDBTK_DATA_PATH=/ref_data/release232` is baked into the image; do NOT pass `--db`.
+  - To run all input genomes on a single shared marker-gene alignment + tree, keep `num_containers=1` (default).
+- **Resources:** cpus=4, memory=64GB, runtime=PT120M (skani's `sketches.db` is ~75 GB; classify_wf for small inputs takes 30-90 min)
+- **Run order:** one container per submission with all inputs (NOT parallel fan-out — the image's `usage:` field recommends `num_containers=1` so all genomes land on the same tree)
 - **Note:** internal classify_wf already uses skani against a mash-prescreened candidate set and reports the single closest reference. That's the top-1 ANI we broadcast.
 
 ---
@@ -163,7 +177,7 @@ The canonical demo notebook for each tool is linked from the `kbaseincubator/cdm
 **Role in CGA:** per-genome quality assessment (completeness, contamination, genome size, GC, N50, total CDS). Broadcast onto every gene row.
 
 - **Image:** `ghcr.io/kbasetest/cdm_checkm2:0.3.0` (note: `kbasetest` org, not `kbaseincubator` - this tool predates `cdm_tool_skeleton` and was Gavin's reference prototype the other 7 wrappers were modelled on; that's why there's no `handoffs/checkm2.md` and no entry in the skeleton's Demo notebooks table)
-- **Refdata:** bundled in image; no UUID needed
+- **Refdata:** checkm2 uniref100 diamond DB, UUID `b5d76426-0ee2-459a-a875-8e0dc8089b54`, mounted at `/ref_data` by default. (The CheckM2 DB is *not* bundled in the image — it ships separately and is bound to the image record. `submit_job` does not need to pass `refdata_id`.)
 - **Input:** one assembly `.fna.gz` per container (genome-mode)
 - **Output:** `quality_report.tsv` (one row per input genome, six columns: Name, Completeness, Contamination, Genome_Size, GC_Content, Contig_N50, Total_Coding_Sequences)
 - **Args (template):**

@@ -11,10 +11,10 @@ How to submit, poll, and recover the 8 CTS jobs that feed CGA assembly. Read `to
         |     - cdm_bakta_proteins  (consumes .faa)
         |     - cdm_kofamscan       (consumes .faa)
         |     - cdm_psortb          (consumes .faa)
-        |     - cdm_gtdbtk          (consumes .fna.gz)
         |     - cdm_checkm2         (consumes .fna.gz)
         |
         +-> cross-genome (one container, all inputs):
+              - cdm_gtdbtk          (classify_wf reads a genome_dir; all inputs land on one tree)
               - cdm_mmseqs2         (consumes all .faa together)
               - cdm_skani           (triangle: consumes all .fna.gz)
               - cdm_skani_gtdb      (search: consumes all .fna.gz)
@@ -24,18 +24,34 @@ No hard dependencies between submission groups in v1: the assembly script joins 
 
 ## Submission pattern
 
-**This skill is designed for kbderl (BERDL JupyterHub) as the primary runtime.** That's where the tenant Delta databases (`u_<user>__prototype` and the public lakehouse tables) live, and where `get_task_service_client()`, `get_minio_client()`, and `get_spark_session()` are auto-injected into the kernel. Use the Python client throughout.
+**This skill runs from any Python process on the BERDL cluster network** — BERDL JupyterHub kernels (where the three helpers below are auto-injected into the kernel as globals) and on-cluster Claude Code / scripts (where they are imported explicitly). Both paths use the same `cdm-task-service-client` underneath; the only difference is whether the helpers are pre-bound in `globals()`. Off-cluster (laptop) is refused — see "Off-cluster execution" below.
+
+Import explicitly. Do not assume Jupyter-injected globals — that assumption breaks every non-Jupyter runtime, even ones that are perfectly capable of running the skill:
 
 ```python
+from berdl_notebook_utils import get_task_service_client, get_minio_client
+from berdl_notebook_utils.setup_spark_session import get_spark_session
+
 tscli  = get_task_service_client()
 mincli = get_minio_client()
 spark  = get_spark_session()
 user   = tscli.whoami()["user"]
 ```
 
-If a user invokes this skill from a local Claude Code session (off-cluster), the right move is to refuse: the assembly step writes to a Delta table that only exists in the kbderl Hive metastore. Tell the user to switch to kbderl JupyterHub and re-invoke. Do not try to do a partial run.
+On kbderl JupyterHub the imports are redundant but harmless — the names just rebind to the same callables.
 
-For each tool, build the `submit_job` call from `tool-catalog.md`. Always set:
+For each tool, build the `submit_job` call from `tool-catalog.md`, but **cross-check against the image record's `usage:` field at submission time**. The catalog templates in this skill have drifted from image-side requirements before (see 2026-05-28 run: bakta needed `--force`, kofamscan needed `-p`/`-k`, gtdbtk's `--skip_ani_screen` had been removed). If the `usage:` field disagrees with the template here, the image wins. Parse with:
+
+```python
+import re
+raw = tscli.get_images()
+for rec in re.split(r"^(?=# )", raw, flags=re.MULTILINE):
+    if "<image-short-name>" in rec.partition("\n")[0]:
+        m = re.search(r"^\s*usage:\s*(.+?)(?=^\s*\w+:|\Z)", rec, re.MULTILINE | re.DOTALL)
+        if m: print(m.group(1).strip())
+```
+
+Always set:
 
 - `cluster="kbase"`
 - `declobber=False` on first runs (idempotent re-runs are explicit, not accidental)
@@ -89,8 +105,13 @@ In either case, after every poll cycle log: how many jobs are pending, how many 
 
 Per-job failure modes you may see:
 
-- `failed` with exit code != 0: read the job's stderr from MinIO at `cts/<output_dir>/.../stderr.log`. Common causes: refdata UUID mismatch (most common), OOM (bump memory in the override and re-run that one job with `declobber=True`), input file malformed (psortb on archaea with `-n` flag etc.).
+- `error` with exit code != 0: read the job's stderr via the CTS REST endpoint `GET /jobs/{job_id}/log/0/stderr` (returns plain text, NOT JSON; `CTSClient._cts_request` will raise `UnexpectedServerResponseError` and leak the body in the exception message, which is currently the easiest way to read it). Common causes seen in real runs:
+  - **Bad args** (most common in practice): e.g. bakta wrote-into-existing-`/out` without `--force`; kofamscan missing `-p`/`-k`; gtdbtk passed a flag from a different release (`--skip_ani_screen` removed in R232). The image record's `usage:` field is authoritative — cross-check it before re-submitting.
+  - Refdata UUID mismatch (rare once registered): caught by SKILL.md Pre-flight step 4.
+  - OOM: bump memory in the resource override and re-run that one job with `declobber=True`.
+  - Input file malformed: psortb on archaea with `-n` is a known soft case (wrong but won't crash).
 - `cancelled`: user or admin cancelled. Surface this; do not silently retry.
+- States that pre-empt the container actually running: `error_processing_submitting`/`error_processing_submitted` mean the container exited fast (often within seconds of `job_submitted`) — usually an arg parsing failure, not a real compute failure.
 - `pending` for >runtime budget: the cluster is busy. Wait or escalate to the user.
 
 **Never auto-retry on `failed`.** Report the failure with the stderr tail, ask the user how to proceed.
@@ -103,8 +124,10 @@ The `--force-resubmit` flag (advanced) overrides this and submits with `declobbe
 
 ## Off-cluster execution: not supported in v1
 
-If a user invokes this skill from a local Claude Code session (not on kbderl JupyterHub), refuse early:
+The supported runtimes are kbderl JupyterHub kernels and any other Python process on the BERDL cluster network (Claude Code, scripts, batch jobs) where `berdl_notebook_utils` is installed. Detection is by *capability probe*, not by hostname — run the three checks in SKILL.md "Pre-flight" step 1.
 
-> "This skill writes to a Delta table in the BERDL lakehouse Hive metastore, which is only reachable from the kbderl JupyterHub kernel. Please open the BERDL JupyterHub at https://hub.berdl.kbase.us, start a kernel, and re-invoke this skill there. Your CTS jobs and MinIO outputs are persistent across sessions, so if you've already submitted jobs, just attach and run the assembly step on kbderl."
+If any probe fails (typical for a laptop without proxy + Spark Connect remote setup), refuse early:
 
-Do not try to fan out CTS jobs via REST from a local session and then "hope to" assemble later. The user pays cluster time and ends with an unassembled pile of outputs.
+> "This skill needs CTS submission, MinIO access, and Spark write to the lakehouse Hive metastore. The runtime probe failed on: `<which check>`. The supported v1 runtimes are BERDL JupyterHub (https://hub.berdl.kbase.us) and on-cluster Python sessions. Off-cluster (laptop) Spark Connect writes to the kbderl Hive metastore have not been validated and are not supported in v1. Your CTS jobs and MinIO outputs are persistent across sessions, so if you've already submitted jobs, switch to a supported runtime and run the assembly step there."
+
+Do not try to fan out CTS jobs via REST from an unverified runtime and then "hope to" assemble later. The user pays cluster time and ends with an unassembled pile of outputs.

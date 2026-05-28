@@ -1,6 +1,6 @@
 ---
 name: cga-workflow
-description: Run the Comparative Genome Annotation (CGA) workflow on user-supplied bacterial or archaeal genomes via the CDM Task Service (CTS). Submits 8 CTS tools (bakta_proteins, kofamscan, psortb, mmseqs2, gtdbtk, skani, skani_gtdb, checkm2) and assembles their outputs into a per-gene Delta wide table plus genome-level auxiliary tables. Use when the user says "annotate these genomes", "build a lines-of-evidence table for these genomes", "characterise this genome set", or asks to run the CGA pipeline.
+description: Run the Comparative Genome Annotation (CGA) workflow on user-supplied bacterial or archaeal genomes, MAGs, or isolates via the CDM Task Service (CTS). Submits 8 CTS tools (bakta_proteins, kofamscan, psortb, mmseqs2, gtdbtk, skani, skani_gtdb, checkm2) and assembles their outputs into a per-gene Delta wide table plus genome-level auxiliary tables. Use when the user says "annotate these genomes / MAGs / isolates", "characterise / characterize this genome", "build a lines-of-evidence table", or asks to run the CGA pipeline. Do NOT use for a single tool in isolation (use remote-compute), metabolic modeling (Layer 2), ontology enrichment (Layer 3), or genomes already annotated by KBase RAST.
 allowed-tools: Bash, Read, Write, AskUserQuestion, Agent
 user-invocable: true
 ---
@@ -20,11 +20,12 @@ This is Layer 1 of a 3-layer model: **CGA -> Metabolic modeling -> Phenotype pre
 ## When to invoke
 
 Trigger phrases include:
-- "annotate these genomes"
+- "annotate these genomes" / "annotate my MAGs" / "annotate this isolate"
 - "build a CGA / lines-of-evidence table for ..."
 - "run the comparative annotation workflow"
 - "compute the wide table for genomes X, Y, Z"
-- "characterise this genome set"
+- "characterise / characterize this genome set"
+- "what genes/functions are in this genome?" (Layer 1 functional annotation)
 
 Do NOT use this skill for:
 - A single tool in isolation (use `remote-compute` and the relevant tool's demo notebook directly)
@@ -32,23 +33,54 @@ Do NOT use this skill for:
 - Ontology enrichment of an existing CGA table (Layer 1 sibling; see issue #23)
 - Genomes already annotated by KBase RAST (this skill calls bakta_proteins, not RAST)
 
-## Runtime: kbderl JupyterHub only (v1)
+## Runtime: any Python on the BERDL cluster network (v1)
 
-This skill is designed for the BERDL JupyterHub (kbderl) as the primary and only supported runtime in v1. The reason: the assembly step writes to a Delta table in the lakehouse Hive metastore, which is only reachable from a kbderl kernel where the tenant Delta databases (e.g. `u_<user>__prototype`) live. Off-cluster invocation is refused (see `modules/orchestration.md`).
+This skill needs three capabilities: CTS submission, MinIO access, and Spark write to the lakehouse Hive metastore (target table lives under `u_<user>__prototype`). All three are available from any Python process with `berdl_notebook_utils` installed and network reach to the BERDL cluster — including BERDL JupyterHub kernels (where the helpers are auto-injected as globals), Claude Code or other agents on cluster-network hosts, and ad-hoc on-cluster scripts.
 
-If the user is not on kbderl, stop and direct them to https://hub.berdl.kbase.us before doing anything else.
+Off-cluster (laptop) runs are **not** supported in v1 — even with the helpers pip-installed locally, MinIO needs proxy setup and the Spark Connect write path to the kbderl Hive metastore has not been validated. The runtime probe in Pre-flight step 1 detects this and refuses, directing the user to https://hub.berdl.kbase.us.
 
 ## Pre-flight
 
 Before submitting any CTS job:
 
-1. **Confirm runtime.** Verify the kernel is on kbderl JupyterHub: `get_task_service_client`, `get_minio_client`, `get_spark_session` should be in the global namespace. If they aren't, refuse and direct the user to kbderl.
+1. **Confirm runtime via explicit imports + live probe** (do not rely on Jupyter-injected globals — they only exist on kbderl kernels, not in regular Python):
+
+   ```python
+   from berdl_notebook_utils import get_task_service_client, get_minio_client
+   from berdl_notebook_utils.setup_spark_session import get_spark_session
+   tscli  = get_task_service_client(); _ = tscli.whoami()                # CTS reachable + auth ok
+   mincli = get_minio_client()                                           # MinIO client constructed
+   spark  = get_spark_session(); _ = spark.sql("SHOW DATABASES").count() # Spark + metastore reachable
+   ```
+
+   If any of the three imports or three probes fails (`ModuleNotFoundError`, `ConnectionError`, auth error, etc.), refuse and direct the user to kbderl JupyterHub. Report which check failed — that distinguishes "wrong runtime" from "transient outage".
 2. **Resolve inputs.** v1 accepts MinIO paths only. The user must provide:
    - A list of genome assembly FASTAs in `cts/io/<user>/...` (gzipped `.fna.gz` or `.fna`)
    - A matching list of prodigal-called protein FASTAs (one `.faa` per genome, same naming convention)
    - If the user has only local files, hand off to the `remote-compute` skill for upload first, then re-invoke this skill.
 3. **Resolve target.** Default output table: `u_<USERNAME>__prototype.comparative_genome_annotation_v1`. Where `<USERNAME>` is the value of `tscli.whoami()["user"]`. If the user supplied `--table-name`, use that.
-4. **Sanity-check refdata.** The CGA workflow binds three refdata UUIDs (see `modules/tool-catalog.md`). Confirm each is reachable via `tscli.refdata.list_refdata()` before submitting jobs.
+4. **Sanity-check refdata.** Refdata binds at the **image record** (each CTS image has `refdata_id` + `default_refdata_mount_point`); `submit_job` only needs to override `refdata_mount_point` if you want a non-default path. The CGA workflow uses four refdata UUIDs across the eight images. Confirm each is registered in CTS and `complete` on the `kbase` cluster before submitting jobs. The `CTSClient` v0.2.1 does not expose a public `refdata` accessor, so call the REST endpoint via the client's internal request helper:
+
+   ```python
+   entries = tscli._cts_request("refdata")["data"]
+   have    = {r["id"]: r for r in entries}
+   needed  = {
+       "bakta v6.0_amr20260324": "30f8ba11-a456-408c-a9f9-7d232ba3ed8e",
+       "kofam 2025-04-30":       "84b31af0-a5a7-4016-906c-9ad9eef34c6a",
+       "GTDB R232":              "bb6352b4-b86f-4e3d-a858-4bc77327ab13",
+       "checkm2 uniref100":      "b5d76426-0ee2-459a-a875-8e0dc8089b54",
+   }
+   def _ready(r):
+       return any(s.get("cluster") == "kbase" and s.get("state") == "complete"
+                  for s in (r.get("statuses") or []))
+   missing = [(label, uid) for label, uid in needed.items()
+              if uid not in have or not _ready(have[uid])]
+   if missing:
+       # refuse: refdata not registered or not staged on kbase cluster
+       ...
+   ```
+
+   `_cts_request` is an underscored method — if `cdm-task-service-client` adds a public `list_refdata()` in a future release, switch to it. Tracking issue (file if not yet open): "cdm-task-service-client: expose public refdata accessor".
 
 If any of the above fails, stop and tell the user explicitly what's missing. Do not submit jobs into a broken setup.
 

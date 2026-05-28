@@ -1,20 +1,22 @@
 # CGA wide-table assembly
 
-How to materialize the per-gene Delta wide table from cached CTS outputs. **This module is self-contained.** All required parsing code is embedded below. The skill runs on the BERDL JupyterHub (kbderl), where `get_minio_client()`, `get_task_service_client()`, `get_spark_session()`, and the tenant Delta databases (`u_<user>__prototype`, public tables, etc.) are all in-process. Do not look for external scripts; everything you need is in this module.
+How to materialize the per-gene Delta wide table from cached CTS outputs. **This module is self-contained.** All required parsing code is embedded below. The skill runs on any Python process on the BERDL cluster network — BERDL JupyterHub kernels (helpers auto-injected as globals) and on-cluster Claude Code / scripts (helpers imported explicitly per SKILL.md Pre-flight step 1). In both, `get_minio_client()`, `get_task_service_client()`, `get_spark_session()`, and the tenant Delta databases (`u_<user>__prototype`, public tables, etc.) are reachable in-process. Do not look for external scripts; everything you need is in this module.
 
 ## Inputs (MinIO paths from orchestration step)
 
 For run_label `<RL>` under `cts/io/<USER>/output/cga/<RL>/`:
 
-- `cdm_bakta_proteins/<i>/<basename>.tsv`  (one per genome)
-- `cdm_bakta_proteins/<i>/<basename>.json` (one per genome - **richer than TSV**, see step 2)
-- `cdm_kofamscan/<i>/<basename>.annotations.tsv`
-- `cdm_psortb/<i>/<basename>.psortb.tsv`
-- `cdm_mmseqs2/<RL>_cluster.tsv`
-- `cdm_gtdbtk/<i>/gtdbtk.bac120.summary.tsv` and/or `gtdbtk.ar53.summary.tsv` (top-level only - exclude `/classify/`, `/identify/`, `/align/`, `/ani_screen/` subpaths)
-- `cdm_skani/triangle.tsv` (auxiliary)
+- `cdm_bakta_proteins/<container_num>/<basename>.tsv`  (one per genome; CTS prefixes the container number `0/`, `1/`, … even for single-container jobs)
+- `cdm_bakta_proteins/<container_num>/<basename>.json` (one per genome - **richer than TSV**, see step 2)
+- `cdm_kofamscan/<container_num>/<basename>.annotations.tsv`
+- `cdm_psortb/out.psortb.tsv` (single file at top of output_dir; pyrodigal `*` stop-codons cause empty output — see `tool-catalog.md` psortb caveat)
+- `cdm_mmseqs2/<RL>_cluster.tsv` (also `_all_seqs.fasta` and `_rep_seq.fasta`)
+- `cdm_gtdbtk/<container_num>/gtdbtk.bac120.summary.tsv` and/or `gtdbtk.ar53.summary.tsv` (top-level only - exclude `/classify/`, `/identify/`, `/align/`, `/ani_screen/` subpaths; classify_wf also writes a `classify/` subtree with intermediates)
+- `cdm_skani/triangle.tsv` (auxiliary; header-only when no within-set pairs clear the AF threshold)
 - `cdm_skani_gtdb/hits.tsv` (auxiliary)
-- `cdm_checkm2/quality_report.tsv` (one combined TSV across all input genomes from the cdm_checkm2 CTS job submitted in the orchestration step)
+- `cdm_checkm2/quality_report.tsv` (one combined TSV across all input genomes; checkm2 also writes `protein_files/` and `diamond_output/` which can be ignored)
+
+**Always list output prefixes with `recursive=True`** and pick files by suffix (e.g. `endswith(".tsv")`), not by exact path — the container-number subdir is real and the `_rerun` suffix appears when a tool is resubmitted with `declobber=True` to a fresh path.
 
 ## Step-by-step
 
